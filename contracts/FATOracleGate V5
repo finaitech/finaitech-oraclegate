@@ -1,0 +1,87 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+import "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v4.9.3/contracts/access/Ownable.sol";
+import "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v4.9.3/contracts/security/ReentrancyGuard.sol";
+import "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v4.9.3/contracts/token/ERC20/IERC20.sol";
+import "https://github.com/Uniswap/v2-core/blob/master/contracts/interfaces/IUniswapV2Pair.sol";
+
+contract FATOracleGateV5 is Ownable, ReentrancyGuard {
+    address public immutable fatToken;
+    address public treasury;
+
+    mapping(address => bool) public allowedTokens;
+    mapping(address => address) public tokenToPair;
+
+    event FATPurchased(address indexed buyer, address indexed tokenIn, uint256 amountIn, uint256 fatOut);
+
+    constructor(address _fatToken, address _treasury) {
+        require(_fatToken != address(0) && _treasury != address(0), "Zero address");
+        fatToken = _fatToken;
+        treasury = _treasury;
+    }
+
+    receive() external payable {}
+
+    function setAllowedToken(address token, address fatPair, bool allowed) external onlyOwner {
+        allowedTokens[token] = allowed;
+        tokenToPair[token] = fatPair;
+    }
+
+    function setTreasury(address _treasury) external onlyOwner {
+        require(_treasury != address(0), "Zero address");
+        treasury = _treasury;
+    }
+
+    function buyWithToken(address tokenIn, uint256 amountIn, uint256 minFatOut) external nonReentrant {
+        require(allowedTokens[tokenIn], "Token not allowed");
+        require(amountIn > 0, "Zero amount");
+
+        address pair = tokenToPair[tokenIn];
+        require(pair != address(0), "Pair not set");
+
+        uint256 fatOut = _getFatOut(pair, tokenIn, amountIn);
+        require(fatOut >= minFatOut, "Slippage exceeded");
+
+        IERC20(tokenIn).transferFrom(msg.sender, address(this), amountIn);
+        IERC20(tokenIn).transfer(treasury, amountIn);
+
+        IERC20(fatToken).transferFrom(treasury, msg.sender, fatOut);
+
+        emit FATPurchased(msg.sender, tokenIn, amountIn, fatOut);
+    }
+
+    function buyWithNative(uint256 minFatOut) external payable nonReentrant {
+        require(msg.value > 0, "No MATIC sent");
+
+        address pair = tokenToPair[address(0)]; // address(0) used for native MATIC
+        require(pair != address(0), "Pair not set");
+
+        uint256 fatOut = _getFatOut(pair, address(0), msg.value);
+        require(fatOut >= minFatOut, "Slippage exceeded");
+
+        (bool success, ) = payable(treasury).call{value: msg.value}("");
+        require(success, "Treasury transfer failed");
+
+        IERC20(fatToken).transferFrom(treasury, msg.sender, fatOut);
+
+        emit FATPurchased(msg.sender, address(0), msg.value, fatOut);
+    }
+
+    function _getFatOut(address pairAddress, address tokenIn, uint256 amountIn) internal view returns (uint256) {
+        IUniswapV2Pair pair = IUniswapV2Pair(pairAddress);
+        address token0 = pair.token0();
+        address token1 = pair.token1();
+        (uint112 reserve0, uint112 reserve1, ) = pair.getReserves();
+
+        require(tokenIn == token0 || tokenIn == token1 || tokenIn == address(0), "Invalid tokenIn for pair");
+
+        (uint112 reserveIn, uint112 reserveOut) = tokenIn == token0 || tokenIn == address(0)
+            ? (reserve0, reserve1)
+            : (reserve1, reserve0);
+
+        require(reserveIn > 0 && reserveOut > 0, "Empty reserves");
+
+        return (amountIn * reserveOut) / reserveIn;
+    }
+}
